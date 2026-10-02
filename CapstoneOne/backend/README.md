@@ -1,0 +1,331 @@
+# CapstoneOne Backend
+
+This backend provides the secure authentication, user-management, and audit APIs for the CapstoneOne platform. It is built with Java 17, Spring Boot, Spring Security, Spring Data JPA, PostgreSQL, Flyway, Resilience4j, and OpenAPI/Swagger support.
+
+The service is designed for a production-style internal application flow with:
+
+- public signup and login
+- role-based authorization (`USER`, `ADMIN`, `AUDITOR`)
+- JWT access tokens and refresh-token rotation
+- server-side session tracking and logout/revocation support
+- administrative user creation and deletion rules
+- audit log exposure with least-privilege database read permissions
+- rate limiting and database circuit-breaker protection
+
+## Project goals
+
+The backend enforces security at the application boundary instead of trusting UI state. It validates inputs, normalizes usernames/emails, stores only hashed passwords, persists sessions in PostgreSQL, rotates refresh tokens, and logs security-relevant events to a separate audit store.
+
+## Technology stack
+
+- Java 17
+- Maven
+- Spring Boot
+- Spring Web MVC
+- Spring Security
+- Spring Data JPA / Hibernate
+- PostgreSQL
+- Flyway
+- Resilience4j
+- JJWT for JWT signing and validation
+- BCrypt for password hashing
+- Springdoc OpenAPI
+- Logback + custom PostgreSQL audit appender
+
+## Project structure
+
+```text
+backend/
+├── src/main/java/com/hdfclife/capstoneone/
+│   ├── config/          # datasource, security, rate limiting, CORS, properties
+│   ├── controller/      # REST endpoints for auth, users, and audit
+│   ├── dto/             # request and response payloads
+│   ├── entity/          # JPA Entities
+│   ├── exception/       # custom exceptions and error handling
+│   ├── filter/          # JWT filters, request logging, auth limits
+│   ├── logging/         # audit events and log configuration
+│   ├── model/           # Business Models
+│   ├── repository/      # Spring Data repositories
+│   ├── security/        # JWT/helper utilities and security logic
+│   ├── service/         # business logic and application services
+│   ├── startup/         # startup migrations and legacy cleanup
+│   └── util/            # shared helpers
+├── src/main/resources/
+│   ├── application.yaml
+│   ├── logback-spring.xml
+│   └── db/
+│       ├── migration/   # Flyway SQL for app tables
+│       ├── README.md    # audit database setup notes
+│       ├── promote-initial-admin.sql
+│       └── ...
+├── .env.example
+├── .env
+├── pom.xml
+├── mvnw
+├── README.md
+├── logs/
+└── target/
+```
+
+## Runtime architecture
+
+The application uses two separate data paths:
+
+1. Main application datasource
+   - stores users and session metadata
+   - managed by the application role
+   - contains `users` and `auth_sessions`
+
+2. Audit datasource
+   - stores read-only operational audit records
+   - separated writer and reader credentials
+   - provisioned by DBA-managed scripts instead of the app login
+
+## Security model
+
+### Authentication and sessions
+
+The backend issues signed JWT access and refresh tokens. Access tokens are short-lived and intended for API bearer authentication. Refresh tokens are stored as a server-side hash plus session metadata and are rotated during refresh to prevent replay and stale-token reuse.
+
+Authentication flow:
+
+1. `POST /signup` creates a normal `USER` account.
+2. `POST /login` verifies credentials and account state.
+3. The server returns an access JWT and sets a secure refresh cookie.
+4. `JwtAuthenticationFilter` validates each bearer token.
+5. The session row is checked to ensure it is active and the token IDs match.
+6. The current user role and enabled/locked state are loaded before authorization is applied.
+
+### Authorization rules
+
+- `USER` and `ADMIN` can access their own profile details.
+- `ADMIN` can list users, inspect them, create users, and delete users.
+- `AUDITOR` can read paginated audit logs only.
+- Unmatched routes are denied by default.
+- Password hashes and tokens are never returned in API payloads.
+
+### Security hardening features
+
+- BCrypt password hashing
+- Jakarta Bean Validation on inbound DTOs
+- duplicate username/email checks
+- correlation IDs for logs and error tracing
+- refresh-token rotation and revocation
+- per-user and per-IP rate limits
+- database circuit breakers
+- least-privilege audit storage access
+
+## Environment configuration
+
+The backend reads environment variables from `.env` via Spring config import.
+
+Example `.env`:
+
+```dotenv
+DB_URL=jdbc:postgresql://localhost:5432/capstone_one
+DB_USERNAME=capstone_app
+DB_PASSWORD=your-local-db-password
+
+AUDIT_DB_WRITER_USERNAME=capstone_audit_writer
+AUDIT_DB_WRITER_PASSWORD=your-audit-writer-password
+AUDIT_DB_READER_USERNAME=capstone_audit_reader
+AUDIT_DB_READER_PASSWORD=your-audit-reader-password
+
+JWT_SECRET=replace-with-a-long-random-secret
+JWT_EXPIRATION=30000
+JWT_REFRESH_EXPIRATION=60000000
+
+FRONTEND_ALLOWED_ORIGINS=http://localhost:3000
+AUTH_REFRESH_COOKIE_SECURE=true
+AUTH_REFRESH_COOKIE_SAME_SITE=Lax
+```
+
+Notes:
+
+- `JWT_SECRET` must be strong and stored in secret management in deployment.
+- `DB_URL` is usually PostgreSQL on `localhost:5432` for local work.
+- `FRONTEND_ALLOWED_ORIGINS` must match the frontend origin used in the browser.
+- `AUTH_REFRESH_COOKIE_SECURE` should stay `true` in production unless local HTTP testing is required.
+
+## Database setup and Flyway
+
+The application uses PostgreSQL with Flyway-managed schema updates.
+
+### Main application database
+
+The main database is initialized and maintained by a DBA or local admin. Example local setup:
+
+```sql
+CREATE ROLE capstone_app LOGIN;
+\password capstone_app
+CREATE DATABASE capstone_one OWNER capstone_app;
+```
+
+Then grant the required privileges on `public` and the application tables. The application login is not a superuser.
+
+Flyway ensures the schema is checked and migrations are applied on startup. Hibernate is configured with:
+
+```yaml
+jpa:
+  hibernate:
+    ddl-auto: validate
+```
+
+This means the app validates schema compatibility instead of auto-generating or modifying database tables.
+
+### Audit database
+
+The audit database is provisioned separately with DBA scripts under `src/main/resources/db`. Those scripts create restricted writer and reader accounts, define the audit table, and configure retention policies.
+
+A separate writer account inserts approved audit columns, while the reader account only selects a safe subset of data. This keeps the audit pipeline isolated from standard application privileges.
+
+## Endpoints
+
+| Method | Route | Access | Purpose |
+| --- | --- | --- | --- |
+| `POST` | `/signup` | Anonymous | Create a new `USER` account |
+| `POST` | `/login` | Public | Validate credentials and issue tokens |
+| `POST` | `/refresh` | Public with valid refresh cookie | Rotate and renew session |
+| `POST` | `/logout` | Authenticated | Revoke current session |
+| `GET` | `/auth` | `USER`, `ADMIN` | Validate identity |
+| `GET` | `/users/me` | `USER`, `ADMIN` | View own safe account summary |
+| `GET` | `/users` | `ADMIN` | List users |
+| `GET` | `/users/{id}` | `ADMIN` | Inspect a user |
+| `POST` | `/users` | `ADMIN` | Create `USER`, `ADMIN`, or `AUDITOR` |
+| `DELETE` | `/users/{id}` | `ADMIN` | Delete user and revoke sessions |
+| `GET` | `/audit/logs` | `AUDITOR` | Read paginated audit records |
+
+## Request examples
+
+### Signup
+
+```http
+POST /signup
+Content-Type: application/json
+
+{
+  "username": "jdoe",
+  "email": "jdoe@example.com",
+  "password": "Str0ngPass!"
+}
+```
+
+### Login
+
+```http
+POST /login
+Content-Type: application/json
+
+{
+  "username": "jdoe",
+  "password": "Str0ngPass!"
+}
+```
+
+### Refresh
+
+```http
+POST /refresh
+Origin: http://localhost:3000
+Cookie: refresh=...;
+```
+
+### Swagger docs
+
+When the app is running, OpenAPI docs are available at:
+
+- `/swagger-ui.html`
+- `/v3/api-docs`
+
+## Error handling and tracing
+
+The API returns structured JSON errors with fields such as:
+
+- timestamp
+- status
+- error
+- message
+- path
+- correlationId
+
+The application supports a `X-Correlation-ID` request header. If a UUID is supplied, it is preserved; otherwise, one is generated. This helps correlate logs and client-reported issues with server-side operations.
+
+Common statuses:
+
+- `400` invalid input or malformed request
+- `401` missing or invalid auth
+- `403` insufficient role or forbidden action
+- `404` resource not found
+- `409` duplicate user or rejected account operation
+- `429` rate limit exceeded
+- `503` database unavailable or breaker open
+- `500` unexpected server error
+
+## Rate limiting
+
+The backend uses Resilience4j with local Caffeine-backed caches for in-memory rate limiting.
+
+Default limits:
+
+- login by username: 5 per minute
+- login by client IP: 30 per minute
+- authenticated requests by user: 120 per minute
+- authenticated requests by IP: 300 per minute
+- sensitive routes (`/users/**`, `/audit/**`): 30 per minute per user
+
+These are instance-local limits and do not coordinate across multiple servers. In multi-instance deployments, enforce limits at a gateway or use a shared distributed rate-limit store.
+
+## Circuit breakers
+
+Two circuit breakers are configured:
+
+- `authenticationDatabase`
+- `auditLogDatabase`
+
+They protect the app from repeated database failures and temporarily stop calling a dependency when it is unhealthy. Failures are tracked with a sliding window and an open-state delay before the system probes again.
+
+## Running the backend locally
+
+Prerequisites:
+
+- Java 17+
+- PostgreSQL running locally
+- Maven wrapper (`mvnw`) is included
+
+Setup:
+
+```bash
+cd CapstoneOne/backend
+cp .env.example .env
+# fill in .env values for DB, audit DB, and JWT secret
+./mvnw spring-boot:run
+```
+
+The API runs on the default Spring Boot port:
+
+- http://localhost:8080
+
+## Testing
+
+Run the backend test suite:
+
+```bash
+cd CapstoneOne/backend
+./mvnw test
+```
+
+The project uses H2-backed test configurations where appropriate, but PostgreSQL-specific checks such as role grants, retention triggers, and audit privileges should still be verified against a disposable PostgreSQL environment before production deployment.
+
+## Operational guidance
+
+- Store secrets in environment variables or a real secret manager.
+- Do not log raw passwords, JWTs, secret keys, or request bodies.
+- Use HTTPS and a trusted proxy configuration in production.
+- Keep at least one active administrator account at all times.
+- Do not modify existing Flyway migration files after they are applied.
+- Use new migrations for schema evolution in shared environments.
+
+## Related docs
+
+- [Database setup guide](src/main/resources/db/README.md)
+- [Project overview](../../README.md)
